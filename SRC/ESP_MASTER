@@ -1,0 +1,217 @@
+/*
+Author: Kåre-Benjamin Hammervold Rørvik 23.9.2020
+On behald of NTNU.
+Edited 20.10.2020
+
+An ESP32 acting as uplink and gateway.
+Recieving over ESP-NOW.
+Traceiving over WiFi with CoT.
+Displays data and packets sent via OLED/7-segment.
+Utilizes dual core processing.
+
+Pinout:
+
+SSD1306      |     ESP-32
+----------------------------------
+SCL/SCK:     |     D22
+SDA/DATA:    |     D21
+VDD:         |     3V3 (3.3V)
+GND:         |     GND
+
+7-Segment    |     ESP-32
+----------------------------------
+CLK          |     D32
+DIO          |     D33
+VDD:         |     3V3 (3.3V)
+GND:         |     GND
+
+//DOIT1 has mac: 24:6F:28:9E:9F:5C
+//DOIT1 has mac: 0x24, 0x6F, 0x28, 0x9E, 0x9F, 0x5C
+//Devkit module C has mac: 24:6F:28:36:53:F4
+*/
+
+#include <esp_now.h>
+#include <WiFi.h>
+#include <CircusESP32Lib.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <TM1637Display.h>
+
+//Prototypes
+void initDisplays();
+void initCores();
+void initESPNOW();
+void writeToDisplays();
+void checkCore();
+void uplinkTheData();
+void onDataRecv();
+
+// Led Dimensions
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+
+// Task objects
+TaskHandle_t Task1;
+TaskHandle_t Task2;
+
+// Oled object
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// 7-segment display 
+const byte PIN_CLK = 32;
+const byte PIN_DIO = 33;
+TM1637Display display_7seg(PIN_CLK, PIN_DIO);
+
+// Circus Declarations
+char ssid[] = "ARNardo"; // Place your wifi SSID here
+char password[] =  "A1R2E3K4"; // Place your wifi password here
+char token[] = "eyJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIyMDQ4In0.UJfXNTEHjAK2nywsuIMd8ZaZXGNIxYodu8zwAHwGyTg"; // Place your token, find it in 'account' at Circus. It will identify you.
+char server[] = "www.circusofthings.com";
+char temperature_key[] = "16906";  // Place the Key of the signal you created at Circus Of Things for the Temperature
+char humidity_key[] = "15160";  // Place the Key of the signal you created at Circus Of Things for the Humidity
+char order_key[] = "5957"; // Type the Key of the Circus Signal you want the ESP32 listen to. 
+CircusESP32Lib circusESP32(server,ssid,password); // The object representing an ESP32 to whom you can order to Write or Read
+
+// Transmitted data
+typedef struct struct_message {
+    char a[32];
+    int b;
+    float c;
+    String d;
+    float e;
+} struct_message;
+struct_message myData;
+
+void setup() {
+  Serial.begin(115200); 
+  initDisplays();
+  initCores();
+  initESPNOW();
+}
+
+//First Core
+void Task1code( void * pvParameters ){
+  checkCore(xPortGetCoreID());
+  while(1){
+    uplinkTheData(20000);
+  } 
+}
+
+//Second Core
+void Task2code( void * pvParameters ){
+  checkCore(xPortGetCoreID());
+  delay(1000);
+  while(1){
+    writeToDisplays();
+  }
+}
+
+
+void loop() {
+  
+}
+
+void initDisplays(){
+  // Initialises the displays.
+  // Oled via I2C and 7-segment directly from I/O.
+  // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+     Serial.println(F("SSD1306 allocation failed"));
+        for(;;);
+     }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 10);
+  display_7seg.setBrightness(7); 
+  pinMode(LED_BUILTIN, OUTPUT);
+}
+
+void initCores() {
+  //create a task that will be executed in the Task1code() function, with priority 1 and executed on core 0
+  xTaskCreatePinnedToCore(
+                    Task1code,   /* Task function. */
+                    "Task1",     /* name of task. */
+                    10000,       /* Stack size of task */
+                    NULL,        /* parameter of the task */
+                    1,           /* priority of the task */
+                    &Task1,      /* Task handle to keep track of created task */
+                    0);          /* pin task to core 0 */                  
+  delay(500); 
+
+  //create a task that will be executed in the Task2code() function, with priority 1 and executed on core 1
+  xTaskCreatePinnedToCore(
+                    Task2code,   /* Task function. */
+                    "Task2",     /* name of task. */
+                    10000,       /* Stack size of task */
+                    NULL,        /* parameter of the task */
+                    1,           /* priority of the task */
+                    &Task2,      /* Task handle to keep track of created task */
+                    1);          /* pin task to core 1 */
+    delay(500); 
+}
+
+void initESPNOW() {
+  // Init ESP-NOW with a promise structure.
+  if (esp_now_init() != ESP_OK) {
+  Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void writeToDisplays(){
+  // Writes the data from myData to OLED and 7-segment display
+  // Refreshes from every instance.
+  display.setCursor(0, 10);
+  display.clearDisplay();
+  display.print("T:");
+  display.print(myData.c);
+  display.println(" C");
+  display.print("H:");
+  display.print(myData.e);
+  display.println("%");
+  display.print("From: ");
+  display.print(myData.d); 
+  display.display();
+  display_7seg.showNumberDec(myData.b);  
+  delay(10);
+}
+
+void checkCore(int coreID) {
+  Serial.print("Core ");
+  Serial.print(coreID);
+  Serial.println(" is up and running successfully"); 
+}
+
+void uplinkTheData(int delayLength){
+    digitalWrite(LED_BUILTIN, HIGH);
+    circusESP32.begin(); // Let the Circus object set up itself for an SSL/Secure connection
+    circusESP32.write(temperature_key,myData.c,token); // Report the temperature measured to Circus.
+    circusESP32.write(humidity_key,myData.e,token); // Report the humidity measured to Circus.
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(10);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    delay(delayLength);
+}
+
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  // callback function 
+  // Receives the incoming data and writes to terminal.
+  memcpy(&myData, incomingData, sizeof(myData)); //copies n characters from memory area src to memory area dest.
+  Serial.print("Bytes received: ");
+  Serial.println(len);
+  Serial.print("Message: ");
+  Serial.print(myData.a);
+  Serial.print(" number: ");
+  Serial.print(myData.b);
+  Serial.print(" from: ");
+  Serial.println(myData.d);
+  Serial.print("Temperature is: ");
+  Serial.println(myData.c);
+  Serial.print("Humidity is : ");
+  Serial.println(myData.e);
+  Serial.println();
+}
